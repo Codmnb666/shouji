@@ -656,9 +656,7 @@ function createArmyFromSelected(owner,divs){
   const aid=G.nextArmyId++;
   let cnt=0; for(const k in G.armies) if(G.armies[k].owner===owner)cnt++;
   const cap=DOCTRINES.regular.max_size;
-  const army={id:aid,owner,name:`第${cnt+1}集团军`,doctrine:'regular',
-    divisions:free.slice(0,cap),general_id:-1,
-    size(){return this.divisions.lengh;},
+  const army={id:aid,owner,name:`第${cnt+1}集团军`,doctrine:'regular'},
     max_size(){return DOCTRINES[this.doctrine].max_size;}
   for(const d of army.divisions) d.army_id=aid;
   G.armies[aid]=army;
