@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0a0e16">
-<title>钢铁雄心 Lite v7.1</title>
+<title>钢铁雄心 Lite v7.2</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{width:100%;height:100%;overflow:hidden;background:#0a0e16;
@@ -154,8 +154,9 @@ html,body{width:100%;height:100%;overflow:hidden;background:#0a0e16;
 <script>
 'use strict';
 /* =====================================================================
-   钢铁雄心 · 简化版 v7.1  ——  Web / Mobile 转译版
+   钢铁雄心 · 简化版 v7.2  ——  Web / Mobile 转译版
    原 Pygame 版 → HTML5 Canvas + DOM UI
+   修复：军 size/max_size 崩溃、相机初始定位、渲染性能、移动迭代安全
    ===================================================================== */
 
 // ==================== 随机数 ====================
@@ -315,7 +316,7 @@ const G={
   uiTab:'overview', recruitType:'infantry', targetMode:null,
   cheats:{infinite_res:false,instant_build:false,instant_train:false,god_mode:false,fast_move:false},
   cheatOpen:false, mode:'select', panelOpen:false,
-  camera:{x:0,y:0,scale:1},
+  camera:{x:0,y:0,scale:1,inited:false},
 };
 
 // ==================== 工具 ====================
@@ -438,7 +439,7 @@ function setupWorld(){
     toast('抗战爆发！',[255,120,100]);
   }
   G.mapDirty=true;
-  centerOnCapital(0);
+  // 相机延迟到 resize 时再居中（此时视口尺寸才是正确的）
 }
 
 function makeGenerals(nid){
@@ -540,11 +541,12 @@ function spawnInitialUnits(){
   }
 }
 
-// ==================== 遍历 ====================
+// ==================== 遍历（安全快照，避免遍历中修改数组） ====================
 function* allDivisions(){
   for(let x=0;x<MAP_W;x++)for(let y=0;y<MAP_H;y++){
     const p=P(x,y);
-    for(const d of p.divisions) yield d;
+    if(!p.divisions.length)continue;
+    for(const d of p.divisions.slice()) yield d;
   }
 }
 
@@ -638,6 +640,14 @@ function seaRoute(sx,sy,gx,gy,maxSteps){
 }
 
 // ==================== 军 / 流派 ====================
+// 【修复】原来在 army 对象上调用 size()/max_size()，但对象并无此方法 → 直接崩溃。
+function armySize(a){ return a && a.divisions ? a.divisions.length : 0; }
+function armyMaxSize(a){
+  if(!a) return 0;
+  const doc=DOCTRINES[a.doctrine]||DOCTRINES.regular;
+  return doc.max_size;
+}
+
 function getDoctrineEffects(d){
   if(d.army_id<0)return null;
   const a=G.armies[d.army_id];
@@ -656,16 +666,16 @@ function createArmyFromSelected(owner,divs){
   const aid=G.nextArmyId++;
   let cnt=0; for(const k in G.armies) if(G.armies[k].owner===owner)cnt++;
   const cap=DOCTRINES.regular.max_size;
-  const army={id:aid,owner,name:`第${cnt+1}集团军`,doctrine:'regular'},
-    max_size(){return DOCTRINES[this.doctrine].max_size;}
+  const army={id:aid,owner,name:`第${cnt+1}集团军`,doctrine:'regular',
+    divisions:free.slice(0,cap),general_id:-1};
   for(const d of army.divisions) d.army_id=aid;
   G.armies[aid]=army;
   if(owner===0){
     G.selectedArmy=aid;
     G.selectedDivs=army.divisions.slice();
     const tiles=new Set(army.divisions.map(d=>`${d.x},${d.y}`)).size;
-    toast(tiles>1?`编成 ${army.name}（${army.size()} 师 / 跨 ${tiles} 省）`
-                 :`编成 ${army.name}（${army.size()} 师）`,[150,230,150]);
+    toast(tiles>1?`编成 ${army.name}（${armySize(army)} 师 / 跨 ${tiles} 省）`
+                 :`编成 ${army.name}（${armySize(army)} 师）`,[150,230,150]);
   }
   return army;
 }
@@ -958,6 +968,7 @@ function tickDay(){
 function recoverDivisions(){
   for(const d of allDivisions()){
     const p=P(d.x,d.y);
+    if(!p)continue;
     if(p.divisions.some(o=>o.owner!==d.owner))continue;
     const n=G.nations[d.owner];
     if(!n||!n.alive)continue;
@@ -1050,6 +1061,7 @@ function checkSurrender(nid){
     for(let x=0;x<MAP_W;x++)for(let y=0;y<MAP_H;y++){
       P(x,y).divisions=P(x,y).divisions.filter(d=>d.owner!==nid);
     }
+    for(const k in G.armies) if(G.armies[k].owner===nid) delete G.armies[k];
     G.mapDirty=true;
   }
 }
@@ -1171,7 +1183,7 @@ function resolveCombat(p){
     base*=(1+d.experience*0.005);
     return base*d.info_def;
   }
-  // 缓存
+  // 缓存兵种基础值（在调用加成函数之前完成）
   for(const d of atkPool.concat(defPool)){
     const u=UNIT_TYPES[d.unit_type]||UNIT_TYPES.infantry;
     d.info_atk=u.atk; d.info_def=u.def;
@@ -1195,11 +1207,16 @@ function resolveCombat(p){
   }
   for(const d of atkPool.concat(defPool)) d.experience=Math.min(100,d.experience+0.25);
 
+  // 先夹紧数值，再统一判定溃退（避免遍历中互相干扰）
   for(const d of activeAttackers.concat(defenders)){
     d.org=Math.max(0,d.org);
     d.strength=Math.max(1,d.strength);
-    if(d.org<=0) retreatOrDestroy(d);
   }
+  const toRetreat=[];
+  for(const d of activeAttackers.concat(defenders)){
+    if(d.org<=0) toRetreat.push(d);
+  }
+  for(const d of toRetreat) retreatOrDestroy(d);
 
   const stillDef=p.divisions.filter(d=>d.owner===defOwner);
   if(!stillDef.length&&p.divisions.length){
@@ -1237,16 +1254,19 @@ function retreatOrDestroy(d){
   const eff=getDoctrineEffects(d);
   let retreatOrg=8.0;
   if(eff) retreatOrg+=(eff.extra.retreat_bonus||0)*20;
-  d.org=retreatOrg; d.in_combat=false;
+  d.org=Math.min(d.max_org,retreatOrg); d.in_combat=false;
   q.divisions.push(d);
 }
 
 // ==================== 移动 ====================
 function tickMovement(){
   const weather=WEATHER_DEFS[G.weather];
-  for(const d of allDivisions()){
-    if(d.tx<0)continue;
-    if(d.in_combat)continue;
+  const movers=[];
+  for(const d of allDivisions()) if(d.tx>=0&&!d.in_combat) movers.push(d);
+
+  for(const d of movers){
+    const cur=P(d.x,d.y);
+    if(!cur || cur.divisions.indexOf(d)<0) continue; // 已被歼灭
     if(d.tx===d.x&&d.ty===d.y){ d.tx=d.ty=-1; d.path=[]; continue; }
     if(!d.path.length){
       d.path=findPath(d.x,d.y,d.tx,d.ty);
@@ -1397,8 +1417,10 @@ function tickNaval(){
       const m=G.nations[j];
       if(!m||!m.alive)continue;
       if(i>j)continue;
-      if(n.navy>0) n.navy=Math.max(0,n.navy-m.navy*0.05);
-      if(m.navy>0) m.navy=Math.max(0,m.navy-n.navy*0.05);
+      const lossA=m.navy*0.05;
+      const lossB=n.navy*0.05;
+      n.navy=Math.max(0,n.navy-lossA);
+      m.navy=Math.max(0,m.navy-lossB);
     }
   }
 }
@@ -1567,6 +1589,7 @@ function pruneSelected(){
   if(!G.selectedDivs.length)return;
   const alive=new Set(allDivisions());
   G.selectedDivs=G.selectedDivs.filter(d=>alive.has(d));
+  if(G.selectedArmy>=0&&!G.armies[G.selectedArmy]) G.selectedArmy=-1;
 }
 
 // ==================== 渲染 ====================
@@ -1583,16 +1606,27 @@ function resize(){
 }
 
 function fitCamera(){
-  const usableH=VH-30-44-14;
+  const usableH=Math.max(80,VH-30-44-14);
   const fitScale=Math.min(VW/MAP_PX_W, usableH/MAP_PX_H);
   const minScale=18/TILE;
   let s=Math.max(fitScale,minScale);
   s=Math.min(s,2.0);
+
+  // 【修复】以旧视口中心为锚点缩放，首次则直接居中到首都
+  const old=G.camera.scale||1;
+  const usableOld=Math.max(80,VH-30-44);
+  const vcx=(VW/2-G.camera.x)/old, vcy=(30+usableOld/2-G.camera.y)/old;
   G.camera.scale=s;
-  // 保持中心
-  if(!G.camera.x&&!G.camera.y) centerOnCapital(0);
-  else clampCamera();
+  if(!G.camera.inited){
+    G.camera.inited=true;
+    centerOnCapital(0);
+  }else{
+    G.camera.x=VW/2-vcx*s;
+    G.camera.y=(30+usableOld/2)-vcy*s;
+    clampCamera();
+  }
 }
+
 function clampCamera(){
   const s=G.camera.scale;
   const mw=MAP_PX_W*s, mh=MAP_PX_H*s;
@@ -1602,9 +1636,15 @@ function clampCamera(){
   if(mh<=usableH) G.camera.y=30+(usableH-mh)/2;
   else G.camera.y=clamp(G.camera.y, 30+usableH-mh, 30);
 }
+
 function centerOnCapital(nid){
   const cap=G.capitals[nid];
-  if(!cap)return;
+  if(!cap){
+    G.camera.x=VW/2-MAP_PX_W*G.camera.scale/2;
+    G.camera.y=30+Math.max(0,(VH-30-44)/2)-MAP_PX_H*G.camera.scale/2;
+    clampCamera();
+    return;
+  }
   const s=G.camera.scale;
   const wx=cap[0]*TILE+TILE/2, wy=cap[1]*TILE+TILE/2;
   const usableH=VH-30-44;
@@ -1769,6 +1809,7 @@ function render(){
     const groups={};
     for(const d of p.divisions)(groups[d.owner]=groups[d.owner]||[]).push(d);
     const ok=Object.keys(groups).map(Number);
+    if(!ok.length)continue;
     const main=ok.reduce((a,b)=>groups[a].length>=groups[b].length?a:b);
     const n=G.nations[main];
     const col=n?n.color:[220,220,220];
@@ -1787,7 +1828,7 @@ function render(){
       ctx.fillStyle='rgba(20,20,20,0.8)';
       ctx.fillRect(ccx-8,ccy-7,16,13);
       ctx.fillStyle='#fff';
-      ctx.font=`bold ${Math.round(10/s*Math.max(0.6,s))}px sans-serif`;
+      ctx.font='bold 10px sans-serif';
       ctx.textAlign='center'; ctx.textBaseline='middle';
       ctx.fillText(String(cnt),ccx,ccy);
     }
@@ -1831,24 +1872,16 @@ function render(){
   ctx.restore();
 
   // 目标模式提示
-  if(G.mode==='bomb'){
+  if(G.mode==='bomb'||G.mode==='move'){
     ctx.setTransform(DPR,0,0,DPR,0,0);
-    ctx.fillStyle='rgba(20,20,30,0.85)';
-    const txt='轰炸模式: 点击敌方省份';
+    const isBomb=G.mode==='bomb';
+    ctx.fillStyle=isBomb?'rgba(20,20,30,0.85)':'rgba(20,30,20,0.85)';
+    const txt=isBomb?'轰炸模式: 点击敌方省份'
+                    :`移动模式: 点击目标省份 (已选 ${G.selectedDivs.length} 师)`;
     ctx.font='bold 13px sans-serif';
     const tw=ctx.measureText(txt).width;
     ctx.fillRect((VW-tw)/2-12, 38, tw+24, 28);
-    ctx.fillStyle='#ffc878';
-    ctx.textAlign='center'; ctx.textBaseline='middle';
-    ctx.fillText(txt, VW/2, 52);
-  }else if(G.mode==='move'){
-    ctx.setTransform(DPR,0,0,DPR,0,0);
-    ctx.fillStyle='rgba(20,30,20,0.85)';
-    const txt='移动模式: 点击目标省份 (已选 '+G.selectedDivs.length+' 师)';
-    ctx.font='bold 13px sans-serif';
-    const tw=ctx.measureText(txt).width;
-    ctx.fillRect((VW-tw)/2-12, 38, tw+24, 28);
-    ctx.fillStyle='#9ae0a0';
+    ctx.fillStyle=isBomb?'#ffc878':'#9ae0a0';
     ctx.textAlign='center'; ctx.textBaseline='middle';
     ctx.fillText(txt, VW/2, 52);
   }
@@ -1875,7 +1908,8 @@ function handleTap(sx,sy){
     pruneSelected();
     if(!G.selectedDivs.length)return;
     const d0=G.selectedDivs[0];
-    const canReach=findPath(d0.x,d0.y,x,y).length>0||(d0.x===x&&d0.y===y);
+    const same=d0.x===x&&d0.y===y;
+    const canReach=same||findPath(d0.x,d0.y,x,y).length>0;
     const tgt=p.owner;
     if(canReach){
       for(const d of G.selectedDivs){
@@ -1890,7 +1924,7 @@ function handleTap(sx,sy){
   }
 
   // select 模式
-  if(!p.land){ G.selected=[x,y]; G.selectedDivs=[]; G.selectedArmy=-1; return; }
+  if(!p.land){ G.selected=[x,y]; G.selectedDivs=[]; G.selectedArmy=-1; updateSelInfo(); return; }
   G.selected=[x,y];
   G.selectedDivs=p.divisions.filter(d=>d.owner===0);
   G.selectedArmy=-1;
@@ -1899,15 +1933,15 @@ function handleTap(sx,sy){
 
 function updateSelInfo(){
   const el=document.getElementById('selinfo');
-  if(!G.selected){ el.textContent=''; return; }
+  if(!G.selected){ if(el.textContent) el.textContent=''; return; }
   const [x,y]=G.selected;
   const p=P(x,y);
-  if(!p.land){ el.textContent='海洋'; return; }
+  if(!p.land){ if(el.textContent!=='海洋') el.textContent='海洋'; return; }
   const oname=G.nations[p.owner]?G.nations[p.owner].name:'无主';
   let s=`(${x},${y}) ${oname} · ${TERRAIN_INFO[p.terrain].label} · VP${p.vp} 工业${p.industry} 要塞Lv${p.fort}`;
   if(p.divisions.length) s+=` · 驻军 ${p.divisions.length}`;
   if(G.selectedDivs.length) s+=` ｜ 已选 ${G.selectedDivs.length} 师`;
-  el.textContent=s;
+  if(el.textContent!==s) el.textContent=s;
 }
 
 function onPointerDown(e){
@@ -1920,7 +1954,7 @@ function onPointerDown(e){
   }else if(pointers.size===2){
     const pts=Array.from(pointers.values());
     const dx=pts[0].x-pts[1].x, dy=pts[0].y-pts[1].y;
-    pinchStart={dist:Math.hypot(dx,dy),scale:G.camera.scale,
+    pinchStart={dist:Math.max(1,Math.hypot(dx,dy)),scale:G.camera.scale,
       mx:(pts[0].x+pts[1].x)/2, my:(pts[0].y+pts[1].y)/2,
       cx:G.camera.x, cy:G.camera.y};
   }
@@ -1942,12 +1976,11 @@ function onPointerMove(e){
   if(pointers.size===2&&pinchStart){
     const pts=Array.from(pointers.values());
     const dx=pts[0].x-pts[1].x, dy=pts[0].y-pts[1].y;
-    const dist=Math.hypot(dx,dy);
+    const dist=Math.max(1,Math.hypot(dx,dy));
     const ratio=dist/pinchStart.dist;
     const newScale=clamp(pinchStart.scale*ratio, 14/TILE, 3.0);
-    // 以中心为锚点缩放
-    const [wx,wy]=[(pinchStart.mx-pinchStart.cx)/pinchStart.scale,
-                   (pinchStart.my-pinchStart.cy)/pinchStart.scale];
+    const wx=(pinchStart.mx-pinchStart.cx)/pinchStart.scale;
+    const wy=(pinchStart.my-pinchStart.cy)/pinchStart.scale;
     G.camera.scale=newScale;
     G.camera.x=pinchStart.mx-wx*newScale;
     G.camera.y=pinchStart.my-wy*newScale;
@@ -1973,11 +2006,16 @@ function onPointerUp(e){
   pointers.delete(e.pointerId);
   if(pointers.size<2) pinchStart=null;
   if(!dragging&&start&&Math.hypot(sx-start.sx,sy-start.sy)<10){
-    // 检查是否点在 HUD 区域
-    if(sy<30||sy>VH-44) return;
-    handleTap(sx,sy);
+    if(sy<30||sy>VH-44) { /* HUD 区域，忽略 */ }
+    else handleTap(sx,sy);
   }
   if(pointers.size===0){ dragStart=null; dragging=false; }
+  else if(pointers.size===1){
+    // 双指变单指：重置拖拽基准，避免跳变
+    const p=Array.from(pointers.values())[0];
+    dragStart={x:p.x,y:p.y,cx:G.camera.x,cy:G.camera.y};
+    dragging=false;
+  }
 }
 
 cv.addEventListener('pointerdown',onPointerDown);
@@ -2014,6 +2052,7 @@ document.querySelectorAll('[data-mode]').forEach(b=>{
 document.getElementById('btnPanel').addEventListener('click',()=>{
   G.panelOpen=!G.panelOpen;
   panelEl.classList.toggle('open',G.panelOpen);
+  if(G.panelOpen) renderPanel(true);
 });
 tabsEl.addEventListener('click',e=>{
   const b=e.target.closest('[data-tab]');
@@ -2071,11 +2110,15 @@ cheatBody.addEventListener('click',e=>{
       const p=P(x,y);
       if(p.land){ p.owner=0; p.divisions=p.divisions.filter(d=>d.owner===0); }
     }
+    cleanupArmies();
     G.mapDirty=true; logMsg('[作弊] 世界已被征服！');
   }else if(k==='instant_win'){
     for(const kk in G.nations){ if(parseInt(kk,10)!==0){ G.nations[kk].alive=false; G.nations[kk].wars.clear(); } }
     for(let x=0;x<MAP_W;x++)for(let y=0;y<MAP_H;y++){ const p=P(x,y); if(p.land)p.owner=0; }
-    for(const d of allDivisions()){ if(d.owner!==0){ const p=P(d.x,d.y); const i=p.divisions.indexOf(d); if(i>=0)p.divisions.splice(i,1); } }
+    for(let x=0;x<MAP_W;x++)for(let y=0;y<MAP_H;y++){
+      P(x,y).divisions=P(x,y).divisions.filter(d=>d.owner===0);
+    }
+    cleanupArmies();
     G.mapDirty=true; logMsg('[作弊] 直接胜利！');
   }
   renderCheat();
@@ -2201,7 +2244,7 @@ function renderResearch(){
   let h=`<div class="row">研究点 <b>${p.research_points.toFixed(0)}</b> ｜ 民用工厂 <b>${p.civ}</b></div>`;
   if(p.active_research){
     const t=TECH_BY_ID[p.active_research];
-    h+=`<button class="btn red" data-a="cancle_research">✕ 取消 ${t?t.name:'?'}</button>`;
+    h+=`<button class="btn red" data-a="cancel_research">✕ 取消 ${t?t.name:'?'}</button>`;
   }
   const cats=['陆军','工业','后勤'];
   for(const cat of cats){
@@ -2274,7 +2317,7 @@ function renderArmies(){
   if(!myArmies.length){ h+='<div class="row" style="color:#8a95a8">（暂未编成任何军）</div>'; return h; }
 
   for(const a of myArmies){
-    const doc=DOCTRINES[a.doctrine];
+    const doc=DOCTRINES[a.doctrine]||DOCTRINES.regular;
     const isSel=G.selectedArmy===a.id;
     const dc=`rgb(${doc.color.join(',')})`;
     let pos='@—';
@@ -2286,7 +2329,7 @@ function renderArmies(){
     }
     h+=`<div class="card ${isSel?'on':''}" data-a="army_sel:${a.id}">
       <div class="t">${a.name} <span style="float:right;color:${dc}">[${doc.name}]</span></div>
-      <div class="s">${a.size()}/${a.max_size()} 师 ｜ ${pos}</div>
+      <div class="s">${armySize(a)}/${armyMaxSize(a)} 师 ｜ ${pos}</div>
     </div>`;
     if(isSel){
       if(p.generals.length){
@@ -2354,6 +2397,7 @@ function doPanelAction(a){
       p.equipment-=ce; p.manpower-=cm;
       if(ut.is_special==='airforce'){ p.airforce+=1; toast(`空军联队 +1 (现 ${p.airforce.toFixed(1)})`,[200,180,240]); }
       else{ p.navy+=1; toast(`海军舰队 +1 (现 ${p.navy.toFixed(1)})`,[130,180,220]); }
+      renderPanel(true);
       return;
     }
     let loc=null;
@@ -2384,7 +2428,7 @@ function doPanelAction(a){
     toast(`防御工事建成 Lv${pr.fort}`,[150,230,150]);
     logMsg(`在 (${pr.x},${pr.y}) 修建防御工事 Lv${pr.fort}`);
   }
-  else if(a==='cancle_research'){ cancelResearch(p); }
+  else if(a==='cancel_research'){ cancelResearch(p); }
   else if(a.startsWith('tech:')){ startResearch(p,a.slice(5)); }
   else if(a.startsWith('policy:')){
     const [,pk,lv]=a.split(':');
@@ -2405,8 +2449,10 @@ function doPanelAction(a){
   }
   else if(a==='army_create'){ createArmyFromSelected(0); }
   else if(a==='army_clear'){ G.selectedDivs=[]; G.selectedArmy=-1; toast('已清空选择',[200,200,200]); }
-  else if(a.startsWith('army_sel:')){ G.selectedArmy=parseInt(a.split(':')[1],10);
-    const ar=G.armies[G.selectedArmy]; if(ar)G.selectedDivs=ar.divisions.slice(); }
+  else if(a.startsWith('army_sel:')){
+    G.selectedArmy=parseInt(a.split(':')[1],10);
+    const ar=G.armies[G.selectedArmy]; if(ar)G.selectedDivs=ar.divisions.slice();
+  }
   else if(a.startsWith('army_doc:')){ const [,aid,dk]=a.split(':'); setArmyDoctrine(parseInt(aid,10),dk); }
   else if(a.startsWith('army_dis:')){ disbandArmy(parseInt(a.split(':')[1],10)); }
   else if(a.startsWith('army_gen:')){ const [,aid,gid]=a.split(':'); assignGeneral(parseInt(aid,10),parseInt(gid,10)); }
@@ -2459,12 +2505,11 @@ function renderToasts(){
   }).join('');
 }
 
-let _lastHud='';
 function updateHUD(){
   const d=`${G.year}年${G.month}月${G.day}日 ${String(G.hour).padStart(2,'0')}:00`;
   if(dateTxt.textContent!==d) dateTxt.textContent=d;
   const w=WEATHER_DEFS[G.weather];
-  const wt=`${w.name}`;
+  const wt=w.name;
   if(wxTxt.textContent!==wt){ wxTxt.textContent=wt; wxTxt.style.color=`rgb(${w.color.join(',')})`; }
   const p=G.nations[0];
   let rt='';
@@ -2473,8 +2518,8 @@ function updateHUD(){
   }
   if(resTxt.textContent!==rt) resTxt.textContent=rt;
 
-  // 面板更新
-  renderPanel(false);
+  // 面板仅在展开时刷新
+  if(G.panelOpen) renderPanel(false);
   updateSelInfo();
 }
 
